@@ -8,13 +8,64 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 
 	openai "github.com/openai/openai-go"
 	"github.com/vaastav/agentic_blueprint/ai_runtime/core"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+const (
+	searchProviderReal = "real"
+	searchProviderMock = "mock"
+)
+
+var searchTracer = otel.Tracer("github.com/vaastav/agentic_blueprint/examples/marketing-agency/workflow/tools/search")
+
+type SearchProvider interface {
+	Mode() string
+	Search(ctx context.Context, query string) ([]SearchResult, error)
+}
+
+type DuckDuckGoSearchProvider struct{}
+
+func (p DuckDuckGoSearchProvider) Mode() string {
+	return searchProviderReal
+}
+
+func (p DuckDuckGoSearchProvider) Search(ctx context.Context, query string) ([]SearchResult, error) {
+	return performSearch(ctx, query)
+}
+
+type UnavailableSearchProvider struct {
+	mode string
+}
+
+func (p UnavailableSearchProvider) Mode() string {
+	return p.mode
+}
+
+func (p UnavailableSearchProvider) Search(ctx context.Context, query string) ([]SearchResult, error) {
+	return nil, fmt.Errorf("search provider mode %q is selected but no search mock provider is configured", p.mode)
+}
+
+func SearchProviderFromEnv() SearchProvider {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("DMAS_SEARCH_API_MODE")))
+	switch mode {
+	case "", searchProviderReal:
+		return DuckDuckGoSearchProvider{}
+	case searchProviderMock:
+		return UnavailableSearchProvider{mode: searchProviderMock}
+	default:
+		return UnavailableSearchProvider{mode: mode}
+	}
+}
 
 type SearchResult struct {
 	Title   string `json:"title"`
@@ -42,28 +93,49 @@ func DuckDuckGoSearchTool() openai.ChatCompletionToolParam {
 }
 
 func DuckDuckGoSearchHandler() core.ToolHandlerFn {
+	return DuckDuckGoSearchHandlerWithProvider(SearchProviderFromEnv())
+}
+
+func DuckDuckGoSearchHandlerWithProvider(provider SearchProvider) core.ToolHandlerFn {
 	return func(ctx context.Context, tc openai.ChatCompletionMessageToolCall) (string, error) {
+		ctx, span := searchTracer.Start(ctx, "tool.search",
+			trace.WithAttributes(
+				attribute.String("tool.name", "duckduckgo_search"),
+				attribute.String("provider_mode", provider.Mode()),
+			),
+		)
+		defer span.End()
+
 		if tc.Function.Name != "duckduckgo_search" {
-			return "", fmt.Errorf("unsupported tool: %s", tc.Function.Name)
+			err := fmt.Errorf("unsupported tool: %s", tc.Function.Name)
+			recordToolError(span, err)
+			return "", err
 		}
 
 		var args struct {
 			Query string `json:"query"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			recordToolError(span, err)
 			return "", fmt.Errorf("invalid arguments: %w", err)
 		}
+		span.SetAttributes(attribute.String("search.query", args.Query))
 
-		results, err := performSearch(ctx, args.Query)
+		results, err := provider.Search(ctx, args.Query)
 		payload := map[string]interface{}{
 			"query":   args.Query,
 			"results": results,
 		}
 		if err != nil {
 			payload["error"] = fmt.Sprintf("duckduckgo search failed: %v", err)
+			recordToolError(span, err)
+		} else {
+			span.SetStatus(codes.Ok, "")
 		}
+		span.SetAttributes(attribute.Int("search.result_count", len(results)))
 		b, err := json.Marshal(payload)
 		if err != nil {
+			recordToolError(span, err)
 			return "", fmt.Errorf("marshal search results: %w", err)
 		}
 

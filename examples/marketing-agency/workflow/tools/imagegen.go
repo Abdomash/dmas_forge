@@ -14,7 +14,59 @@ import (
 
 	openai "github.com/openai/openai-go"
 	"github.com/vaastav/agentic_blueprint/ai_runtime/core"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+const (
+	imageProviderReal = "real"
+	imageProviderMock = "mock"
+)
+
+var imageTracer = otel.Tracer("github.com/vaastav/agentic_blueprint/examples/marketing-agency/workflow/tools/imagegen")
+
+type ImageProvider interface {
+	Mode() string
+	GenerateJPEG(ctx context.Context, prompt string) ([]byte, error)
+}
+
+type OpenAIImageProvider struct {
+	client *openai.Client
+}
+
+func (p OpenAIImageProvider) Mode() string {
+	return imageProviderReal
+}
+
+func (p OpenAIImageProvider) GenerateJPEG(ctx context.Context, prompt string) ([]byte, error) {
+	return generateJPEG(ctx, p.client, prompt)
+}
+
+type UnavailableImageProvider struct {
+	mode string
+}
+
+func (p UnavailableImageProvider) Mode() string {
+	return p.mode
+}
+
+func (p UnavailableImageProvider) GenerateJPEG(ctx context.Context, prompt string) ([]byte, error) {
+	return nil, fmt.Errorf("image provider mode %q is selected but no image mock provider is configured", p.mode)
+}
+
+func ImageProviderFromEnv(client *openai.Client) ImageProvider {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("DMAS_IMAGE_API_MODE")))
+	switch mode {
+	case "", imageProviderReal:
+		return OpenAIImageProvider{client: client}
+	case imageProviderMock:
+		return UnavailableImageProvider{mode: imageProviderMock}
+	default:
+		return UnavailableImageProvider{mode: mode}
+	}
+}
 
 // ImageGenTool returns the OpenAI function-calling tool definition for
 // generate_image. The LLM supplies a prompt and receives metadata for the
@@ -42,30 +94,54 @@ func ImageGenTool() openai.ChatCompletionToolParam {
 // converts the resulting PNG to JPEG, stores it locally, and returns file
 // metadata. The image bytes never flow through the LLM context.
 func ImageGenHandler(client *openai.Client) core.ToolHandlerFn {
+	return ImageGenHandlerWithProvider(ImageProviderFromEnv(client))
+}
+
+func ImageGenHandlerWithProvider(provider ImageProvider) core.ToolHandlerFn {
 	return func(ctx context.Context, tc openai.ChatCompletionMessageToolCall) (string, error) {
+		ctx, span := imageTracer.Start(ctx, "tool.image.generate",
+			trace.WithAttributes(
+				attribute.String("tool.name", "generate_image"),
+				attribute.String("provider_mode", provider.Mode()),
+			),
+		)
+		defer span.End()
+
 		if tc.Function.Name != "generate_image" {
-			return "", fmt.Errorf("unsupported tool: %s", tc.Function.Name)
+			err := fmt.Errorf("unsupported tool: %s", tc.Function.Name)
+			recordToolError(span, err)
+			return "", err
 		}
 
 		var args struct {
 			Prompt string `json:"prompt"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			recordToolError(span, err)
 			return "", fmt.Errorf("invalid arguments: %w", err)
 		}
 		if strings.TrimSpace(args.Prompt) == "" {
-			return "", fmt.Errorf("empty prompt")
+			err := fmt.Errorf("empty prompt")
+			recordToolError(span, err)
+			return "", err
 		}
 
-		jpegBytes, err := generateJPEG(ctx, client, args.Prompt)
+		jpegBytes, err := provider.GenerateJPEG(ctx, args.Prompt)
 		if err != nil {
+			recordToolError(span, err)
 			return "", err
 		}
 
 		path, err := saveJPEG(jpegBytes)
 		if err != nil {
+			recordToolError(span, err)
 			return "", err
 		}
+		span.SetAttributes(
+			attribute.Int("tool.output.size_bytes", len(jpegBytes)),
+			attribute.String("tool.output.mime_type", "image/jpeg"),
+		)
+		span.SetStatus(codes.Ok, "")
 
 		return marshalJSON(map[string]interface{}{
 			"status":     "success",
@@ -139,4 +215,9 @@ func marshalJSON(v interface{}) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+func recordToolError(span trace.Span, err error) {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
 }
