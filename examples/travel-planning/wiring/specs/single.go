@@ -15,23 +15,16 @@ import (
 	wf "github.com/vaastav/agentic_blueprint/examples/travel-planning/workflow"
 )
 
-var Docker = cmdbuilder.SpecOption{
-	Name:        "docker",
-	Description: "Deploys travel-planning agents in containers with HTTP, using OpenAI models",
-	Build:       makeDockerSpec,
+var Single = cmdbuilder.SpecOption{
+	Name:        "single",
+	Description: "Deploys the full travel-planning workflow in a single container with an HTTP endpoint",
+	Build:       makeSingleSpec,
 }
 
-func makeDockerSpec(spec wiring.WiringSpec) ([]string, error) {
+func makeSingleSpec(spec wiring.WiringSpec) ([]string, error) {
 	modelInfo, err := model.GetModelInfo()
 	if err != nil {
 		return []string{}, err
-	}
-
-	applyDockerDefaults := func(serviceName string) string {
-		http.Deploy(spec, serviceName)
-		proc := goproc.Deploy(spec, serviceName)
-		opentelemetry.Logger(spec, proc)
-		return linuxcontainer.Deploy(spec, serviceName)
 	}
 
 	plannerLLM := openai_plugin.OpenAILLMAgent(spec, "planner_llm", modelInfo.URL, modelInfo.Key, modelInfo.Name, openai_plugin.AgentConfig{})
@@ -54,11 +47,10 @@ func makeDockerSpec(spec wiring.WiringSpec) ([]string, error) {
 		opentelemetry.Instrument(spec, service, collector)
 	}
 
-	plannerContainer := applyDockerDefaults(plannerService)
-	localContainer := applyDockerDefaults(localService)
-	languageContainer := applyDockerDefaults(languageService)
-	summaryContainer := applyDockerDefaults(summaryService)
-	coordinatorContainer := applyDockerDefaults(coordinatorService)
+	http.Deploy(spec, coordinatorService)
+	proc := goproc.Deploy(spec, coordinatorService)
+	opentelemetry.Logger(spec, proc)
+	ctr := linuxcontainer.Deploy(spec, coordinatorService)
 
-	return []string{plannerContainer, localContainer, languageContainer, summaryContainer, coordinatorContainer}, nil
+	return []string{ctr}, nil
 }

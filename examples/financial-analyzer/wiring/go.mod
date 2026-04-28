@@ -21,6 +21,7 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.mongodb.org/mongo-driver v1.15.0 // indirect
 	go.opentelemetry.io/otel v1.26.0 // indirect
+	go.opentelemetry.io/otel/exporters/jaeger v1.17.0 // indirect
 	go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.26.0 // indirect
 	go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.26.0 // indirect
 	go.opentelemetry.io/otel/metric v1.26.0 // indirect
