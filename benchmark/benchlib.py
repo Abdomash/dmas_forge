@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import statistics
 import subprocess
 import threading
@@ -16,6 +17,9 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+ADDRESS_RE = re.compile(r"^(?P<host>[^:]+):(?P<port>\d+)$")
+SERVICE_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_.-]+):\s*$")
+PORT_RE = re.compile(r'^      - ".*:(?P<internal>\d+)"\s*$')
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,36 @@ class RequestCycler:
             req = self._requests[self._idx % len(self._requests)]
             self._idx += 1
             return req
+
+
+@dataclass(frozen=True)
+class StartupMetadata:
+    status: str
+    original_manifest_url: str
+    resolved_runtime_url: str
+    discovery_source: str
+    readiness_request_id: str
+    attempts: int
+    consecutive_successes_required: int
+    wait_seconds: float
+    candidate_urls: list[str]
+    last_error: str = ""
+    last_status: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "original_manifest_url": self.original_manifest_url,
+            "resolved_runtime_url": self.resolved_runtime_url,
+            "discovery_source": self.discovery_source,
+            "readiness_request_id": self.readiness_request_id,
+            "attempts": self.attempts,
+            "consecutive_successes_required": self.consecutive_successes_required,
+            "wait_seconds": self.wait_seconds,
+            "candidate_urls": self.candidate_urls,
+            "last_error": self.last_error,
+            "last_status": self.last_status,
+        }
 
 
 def load_manifest(path: Path) -> list[BenchmarkRun]:
@@ -133,6 +167,196 @@ def build_url(endpoint: Endpoint, request: dict[str, Any]) -> str:
     return endpoint.url + (sep + encoded if encoded else "")
 
 
+def resolve_endpoint_and_wait(
+    run: BenchmarkRun,
+    requests: list[dict[str, Any]],
+    build_dir: Path,
+    startup_timeout: float = 90.0,
+    poll_interval: float = 0.5,
+    consecutive_successes: int = 2,
+) -> tuple[Endpoint | None, dict[str, Any]]:
+    warmup_request = requests[0]
+    candidates = discover_candidate_endpoints(run.endpoint, build_dir)
+    candidate_urls = [endpoint.url for _, endpoint in candidates]
+    consecutive: dict[str, int] = {endpoint.url: 0 for _, endpoint in candidates}
+    attempts = 0
+    started = time.monotonic()
+    deadline = started + startup_timeout
+    last_error = ""
+    last_status = 0
+
+    while time.monotonic() < deadline:
+        for source, endpoint in candidates:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempts += 1
+            probe_url = build_url(endpoint, warmup_request)
+            status, error, _, _ = perform_request(
+                probe_url, max(1.0, min(run.timeout, 5.0, remaining))
+            )
+            last_error = error
+            last_status = status
+            if 200 <= status < 300 and error == "":
+                consecutive[endpoint.url] = consecutive.get(endpoint.url, 0) + 1
+                if consecutive[endpoint.url] >= consecutive_successes:
+                    metadata = StartupMetadata(
+                        status="ready",
+                        original_manifest_url=run.endpoint.url,
+                        resolved_runtime_url=endpoint.url,
+                        discovery_source=source,
+                        readiness_request_id=str(warmup_request["id"]),
+                        attempts=attempts,
+                        consecutive_successes_required=consecutive_successes,
+                        wait_seconds=round(time.monotonic() - started, 3),
+                        candidate_urls=candidate_urls,
+                        last_error=last_error,
+                        last_status=last_status,
+                    )
+                    return endpoint, metadata.to_dict()
+            else:
+                consecutive[endpoint.url] = 0
+        time.sleep(poll_interval)
+
+    metadata = StartupMetadata(
+        status="timeout",
+        original_manifest_url=run.endpoint.url,
+        resolved_runtime_url="",
+        discovery_source="",
+        readiness_request_id=str(warmup_request["id"]),
+        attempts=attempts,
+        consecutive_successes_required=consecutive_successes,
+        wait_seconds=round(time.monotonic() - started, 3),
+        candidate_urls=candidate_urls,
+        last_error=last_error,
+        last_status=last_status,
+    )
+    return None, metadata.to_dict()
+
+
+def discover_candidate_endpoints(
+    endpoint: Endpoint, build_dir: Path
+) -> list[tuple[str, Endpoint]]:
+    candidates: list[tuple[str, Endpoint]] = []
+    seen: set[str] = set()
+
+    for source, port in discover_ports_from_local_env(build_dir):
+        candidate = endpoint_with_port(endpoint, port)
+        if candidate.url in seen:
+            continue
+        seen.add(candidate.url)
+        candidates.append((source, candidate))
+
+    for source, port in discover_ports_from_compose(endpoint, build_dir):
+        candidate = endpoint_with_port(endpoint, port)
+        if candidate.url in seen:
+            continue
+        seen.add(candidate.url)
+        candidates.append((source, candidate))
+
+    if endpoint.url not in seen:
+        candidates.append(("manifest", endpoint))
+    return candidates
+
+
+def discover_ports_from_local_env(build_dir: Path) -> list[tuple[str, int]]:
+    env_file = build_dir / ".local.env"
+    if not env_file.exists():
+        return []
+
+    ports: list[tuple[str, int]] = []
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if not key.endswith("_BIND_ADDR"):
+            continue
+        parsed = parse_address_port(value)
+        if parsed is None:
+            continue
+        ports.append((f"local_env:{key}", parsed))
+    return ports
+
+
+def discover_ports_from_compose(
+    endpoint: Endpoint, build_dir: Path
+) -> list[tuple[str, int]]:
+    compose_file = build_dir / "docker" / "docker-compose.yml"
+    if not compose_file.exists():
+        return []
+
+    compose_dir = compose_file.parent
+    ports: list[tuple[str, int]] = []
+    for service, internal_port in parse_compose_service_ports(compose_file):
+        try:
+            proc = subprocess.run(
+                ["docker", "compose", "port", service, str(internal_port)],
+                cwd=compose_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            return ports
+        if proc.returncode != 0:
+            continue
+        for line in proc.stdout.splitlines():
+            parsed = parse_address_port(line.strip())
+            if parsed is None:
+                continue
+            ports.append((f"compose:{service}:{internal_port}", parsed))
+    return ports
+
+
+def parse_compose_service_ports(compose_file: Path) -> list[tuple[str, int]]:
+    pairs: list[tuple[str, int]] = []
+    service = ""
+    in_ports = False
+    for line in compose_file.read_text(encoding="utf-8").splitlines():
+        service_match = SERVICE_RE.match(line)
+        if service_match:
+            service = service_match.group("name")
+            in_ports = False
+            continue
+        if service and line == "    ports:":
+            in_ports = True
+            continue
+        if in_ports:
+            port_match = PORT_RE.match(line)
+            if port_match:
+                pairs.append((service, int(port_match.group("internal"))))
+                continue
+            if not line.startswith("      "):
+                in_ports = False
+    return pairs
+
+
+def parse_address_port(value: str) -> int | None:
+    candidate = value.strip()
+    if candidate.startswith("[") and "]:" in candidate:
+        candidate = candidate.split("]:", 1)[1]
+    if ":" not in candidate:
+        return None
+    match = ADDRESS_RE.match(candidate)
+    if match is not None:
+        return int(match.group("port"))
+    try:
+        return int(candidate.rsplit(":", 1)[1])
+    except ValueError:
+        return None
+
+
+def endpoint_with_port(endpoint: Endpoint, port: int) -> Endpoint:
+    parsed = urllib.parse.urlsplit(endpoint.url)
+    scheme = parsed.scheme or "http"
+    netloc = f"localhost:{port}"
+    url = urllib.parse.urlunsplit(
+        (scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+    return Endpoint(method=endpoint.method, url=url, params=dict(endpoint.params))
+
+
 def provider_env(provider_mode: str) -> dict[str, str]:
     mode = provider_mode.strip().lower() or "mock"
     return {
@@ -178,10 +402,16 @@ def compose_up(build_dir: Path, env: dict[str, str]) -> None:
 def compose_down(build_dir: Path) -> None:
     compose_dir = build_dir / "docker"
     if compose_dir.exists():
-        subprocess.run(["docker", "compose", "down", "--remove-orphans"], cwd=compose_dir, check=False)
+        subprocess.run(
+            ["docker", "compose", "down", "--remove-orphans"],
+            cwd=compose_dir,
+            check=False,
+        )
 
 
-def start_resource_sampler(run: BenchmarkRun, out_path: Path, interval: float = 1.0) -> tuple[threading.Event, threading.Thread]:
+def start_resource_sampler(
+    run: BenchmarkRun, out_path: Path, interval: float = 1.0
+) -> tuple[threading.Event, threading.Thread]:
     stop = threading.Event()
 
     def sample_loop() -> None:
@@ -263,7 +493,9 @@ def sample_process(pattern: str) -> list[dict[str, Any]]:
     return rows
 
 
-def run_profile(run: BenchmarkRun, requests: list[dict[str, Any]], result_dir: Path) -> list[dict[str, Any]]:
+def run_profile(
+    run: BenchmarkRun, requests: list[dict[str, Any]], result_dir: Path
+) -> list[dict[str, Any]]:
     result_dir.mkdir(parents=True, exist_ok=True)
     all_results: list[dict[str, Any]] = []
     for repeat in range(run.repeats):
@@ -274,20 +506,29 @@ def run_profile(run: BenchmarkRun, requests: list[dict[str, Any]], result_dir: P
     return all_results
 
 
-def execute_repeat(run: BenchmarkRun, cycler: RequestCycler, repeat: int) -> list[dict[str, Any]]:
+def execute_repeat(
+    run: BenchmarkRun, cycler: RequestCycler, repeat: int
+) -> list[dict[str, Any]]:
     if run.profile == "smoke":
         total = max(1, run.concurrency)
         return execute_fixed_count(run, cycler, repeat, total)
     return execute_duration(run, cycler, repeat)
 
 
-def execute_fixed_count(run: BenchmarkRun, cycler: RequestCycler, repeat: int, count: int) -> list[dict[str, Any]]:
+def execute_fixed_count(
+    run: BenchmarkRun, cycler: RequestCycler, repeat: int, count: int
+) -> list[dict[str, Any]]:
     with ThreadPoolExecutor(max_workers=run.concurrency) as executor:
-        futures = [executor.submit(send_one, run, cycler.next(), repeat, i) for i in range(count)]
+        futures = [
+            executor.submit(send_one, run, cycler.next(), repeat, i)
+            for i in range(count)
+        ]
         return [future.result() for future in as_completed(futures)]
 
 
-def execute_duration(run: BenchmarkRun, cycler: RequestCycler, repeat: int) -> list[dict[str, Any]]:
+def execute_duration(
+    run: BenchmarkRun, cycler: RequestCycler, repeat: int
+) -> list[dict[str, Any]]:
     stop_at = time.monotonic() + run.duration
     results: list[dict[str, Any]] = []
     sequence = 0
@@ -295,7 +536,9 @@ def execute_duration(run: BenchmarkRun, cycler: RequestCycler, repeat: int) -> l
         futures = set()
         while time.monotonic() < stop_at or futures:
             while time.monotonic() < stop_at and len(futures) < run.concurrency:
-                futures.add(executor.submit(send_one, run, cycler.next(), repeat, sequence))
+                futures.add(
+                    executor.submit(send_one, run, cycler.next(), repeat, sequence)
+                )
                 sequence += 1
             done = {future for future in futures if future.done()}
             if not done:
@@ -307,20 +550,11 @@ def execute_duration(run: BenchmarkRun, cycler: RequestCycler, repeat: int) -> l
     return results
 
 
-def send_one(run: BenchmarkRun, request: dict[str, Any], repeat: int, sequence: int) -> dict[str, Any]:
+def send_one(
+    run: BenchmarkRun, request: dict[str, Any], repeat: int, sequence: int
+) -> dict[str, Any]:
     url = build_url(run.endpoint, request)
-    started = time.perf_counter()
-    status = 0
-    error = ""
-    size = 0
-    try:
-        with urllib.request.urlopen(url, timeout=run.timeout) as resp:
-            body = resp.read()
-            status = resp.status
-            size = len(body)
-    except Exception as exc:  # noqa: BLE001 - benchmark records all failures.
-        error = str(exc)
-    latency_ms = (time.perf_counter() - started) * 1000.0
+    status, error, size, latency_ms = perform_request(url, run.timeout)
     return {
         "example": run.example,
         "mode": run.mode,
@@ -338,6 +572,22 @@ def send_one(run: BenchmarkRun, request: dict[str, Any], repeat: int, sequence: 
     }
 
 
+def perform_request(url: str, timeout: float) -> tuple[int, str, int, float]:
+    started = time.perf_counter()
+    status = 0
+    error = ""
+    size = 0
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            body = resp.read()
+            status = resp.status
+            size = len(body)
+    except Exception as exc:  # noqa: BLE001 - benchmark records all failures.
+        error = str(exc)
+    latency_ms = (time.perf_counter() - started) * 1000.0
+    return status, error, size, latency_ms
+
+
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
@@ -345,20 +595,25 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def load_result_rows(result_dir: Path) -> list[dict[str, Any]]:
-	rows: list[dict[str, Any]] = []
-	for path in sorted(result_dir.glob("**/requests-repeat-*.jsonl")):
-		with path.open("r", encoding="utf-8") as f:
-			for line in f:
-				stripped = line.strip()
-				if stripped:
-					rows.append(json.loads(stripped))
-	return rows
+    rows: list[dict[str, Any]] = []
+    for path in sorted(result_dir.glob("**/requests-repeat-*.jsonl")):
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped:
+                    rows.append(json.loads(stripped))
+    return rows
 
 
 def aggregate_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
     for row in rows:
-        key = (row["example"], row["mode"], row["profile"], row.get("provider_mode", ""))
+        key = (
+            row["example"],
+            row["mode"],
+            row["profile"],
+            row.get("provider_mode", ""),
+        )
         groups.setdefault(key, []).append(row)
 
     summaries: list[dict[str, Any]] = []
@@ -396,7 +651,18 @@ def percentile(values: list[float], pct: int) -> float:
 
 
 def write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    fieldnames = ["example", "mode", "profile", "provider_mode", "requests", "successes", "errors", "p50_ms", "p95_ms", "p99_ms"]
+    fieldnames = [
+        "example",
+        "mode",
+        "profile",
+        "provider_mode",
+        "requests",
+        "successes",
+        "errors",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+    ]
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

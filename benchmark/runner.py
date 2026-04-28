@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from benchmark.benchlib import (
@@ -12,6 +13,7 @@ from benchmark.benchlib import (
     load_manifest,
     load_requests,
     provider_env,
+    resolve_endpoint_and_wait,
     run_profile,
     start_resource_sampler,
 )
@@ -36,17 +38,38 @@ def main() -> int:
         run_dir = root / name
         build_dir = run_dir / "build"
         result_dir = run_dir / "raw"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        result_dir.mkdir(parents=True, exist_ok=True)
         env = provider_env(run.provider_mode)
-        (run_dir / "run.json").write_text(json.dumps(run.__dict__, default=str, indent=2, sort_keys=True), encoding="utf-8")
+        requests = load_requests(run.requests)
+        (run_dir / "run.json").write_text(
+            json.dumps(run.__dict__, default=str, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         try:
             if not args.no_build:
                 build_deployment(run, build_dir)
             if not args.no_start:
                 compose_up(build_dir, env)
-            stop, thread = start_resource_sampler(run, run_dir / "raw" / "resources.jsonl")
+
+            resolved_endpoint, startup = resolve_endpoint_and_wait(
+                run, requests, build_dir
+            )
+            (run_dir / "startup.json").write_text(
+                json.dumps(startup, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            if resolved_endpoint is None:
+                raise RuntimeError(
+                    f"startup readiness failed for {name}: {startup.get('last_error') or startup.get('status')}"
+                )
+
+            resolved_run = replace(run, endpoint=resolved_endpoint)
+            stop, thread = start_resource_sampler(
+                resolved_run, run_dir / "raw" / "resources.jsonl"
+            )
             try:
-                requests = load_requests(run.requests)
-                run_profile(run, requests, result_dir)
+                run_profile(resolved_run, requests, result_dir)
             finally:
                 stop.set()
                 thread.join(timeout=2)

@@ -4,6 +4,7 @@ import (
 	"github.com/blueprint-uservices/blueprint/blueprint/pkg/wiring"
 	"github.com/blueprint-uservices/blueprint/plugins/cmdbuilder"
 	"github.com/blueprint-uservices/blueprint/plugins/goproc"
+	"github.com/blueprint-uservices/blueprint/plugins/http"
 	"github.com/blueprint-uservices/blueprint/plugins/jaeger"
 	"github.com/blueprint-uservices/blueprint/plugins/linuxcontainer"
 	"github.com/blueprint-uservices/blueprint/plugins/opentelemetry"
@@ -16,14 +17,18 @@ import (
 
 var A2A = cmdbuilder.SpecOption{
 	Name:        "a2a",
-	Description: "Deploys each agent in a separate container with a2a connecting the agents, uses OpenAI for providing the agents",
+	Description: "Deploys sub-agents over A2A while exposing the frontend weather agent over HTTP",
 	Build:       makeA2ASpec,
 }
 
 func makeA2ASpec(spec wiring.WiringSpec) ([]string, error) {
 
-	applyDockerDefaults := func(spec wiring.WiringSpec, serviceName string) string {
-		a2a.Deploy(spec, serviceName)
+	applyDockerDefaults := func(spec wiring.WiringSpec, serviceName string, exposeHTTP bool) string {
+		if exposeHTTP {
+			http.Deploy(spec, serviceName)
+		} else {
+			a2a.Deploy(spec, serviceName)
+		}
 		proc := goproc.Deploy(spec, serviceName)
 		opentelemetry.Logger(spec, proc)
 		return linuxcontainer.Deploy(spec, serviceName)
@@ -48,8 +53,8 @@ func makeA2ASpec(spec wiring.WiringSpec) ([]string, error) {
 	opentelemetry.Instrument(spec, disaster_agent, collector)
 	opentelemetry.Instrument(spec, weather_agent, collector)
 
-	disaster_ctr := applyDockerDefaults(spec, disaster_agent)
-	weather_ctr := applyDockerDefaults(spec, weather_agent)
+	disaster_ctr := applyDockerDefaults(spec, disaster_agent, false)
+	weather_ctr := applyDockerDefaults(spec, weather_agent, true)
 
 	return []string{disaster_ctr, weather_ctr}, nil
 }

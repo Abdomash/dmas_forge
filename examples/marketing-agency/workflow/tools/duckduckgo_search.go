@@ -43,6 +43,20 @@ func (p DuckDuckGoSearchProvider) Search(ctx context.Context, query string) ([]S
 	return performSearch(ctx, query)
 }
 
+type MockSearchProvider struct{}
+
+func (p MockSearchProvider) Mode() string {
+	return searchProviderMock
+}
+
+func (p MockSearchProvider) Search(ctx context.Context, query string) ([]SearchResult, error) {
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" {
+		return nil, fmt.Errorf("query cannot be empty")
+	}
+	return deterministicMockSearchResults(trimmed), nil
+}
+
 type UnavailableSearchProvider struct {
 	mode string
 }
@@ -61,7 +75,7 @@ func SearchProviderFromEnv() SearchProvider {
 	case "", searchProviderReal:
 		return DuckDuckGoSearchProvider{}
 	case searchProviderMock:
-		return UnavailableSearchProvider{mode: searchProviderMock}
+		return MockSearchProvider{}
 	default:
 		return UnavailableSearchProvider{mode: mode}
 	}
@@ -181,6 +195,7 @@ func performSearch(ctx context.Context, query string) ([]SearchResult, error) {
 
 var anchorRE = regexp.MustCompile(`<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>`)
 var stripTagsRE = regexp.MustCompile(`<[^>]+>`)
+var mockSlugRE = regexp.MustCompile(`[^a-z0-9]+`)
 
 func extractDuckDuckGoResults(body string, maxResults int) []SearchResult {
 	matches := anchorRE.FindAllStringSubmatch(body, -1)
@@ -197,4 +212,36 @@ func extractDuckDuckGoResults(body string, maxResults int) []SearchResult {
 		results = append(results, SearchResult{Title: title, URL: href, Snippet: ""})
 	}
 	return results
+}
+
+func deterministicMockSearchResults(query string) []SearchResult {
+	normalized := strings.ToLower(strings.TrimSpace(query))
+	slug := strings.Trim(mockSlugRE.ReplaceAllString(normalized, "-"), "-")
+	if slug == "" {
+		slug = "brand"
+	}
+
+	topic := normalized
+	words := strings.Fields(normalized)
+	if len(words) > 4 {
+		topic = strings.Join(words[:4], " ")
+	}
+
+	return []SearchResult{
+		{
+			Title:   strings.Title(slug) + " Official Site",
+			URL:     "https://mock-search.example/brands/" + slug,
+			Snippet: fmt.Sprintf("Mock result for %q covering the main brand offer and positioning.", topic),
+		},
+		{
+			Title:   strings.Title(slug) + " Market Trends",
+			URL:     "https://mock-search.example/research/" + slug + "-market-trends",
+			Snippet: fmt.Sprintf("Deterministic market notes for %q, including audience and competitor themes.", topic),
+		},
+		{
+			Title:   strings.Title(slug) + " Creative References",
+			URL:     "https://mock-search.example/creative/" + slug + "-references",
+			Snippet: fmt.Sprintf("Stable creative inspiration references for %q used during benchmark runs.", topic),
+		},
+	}
 }
