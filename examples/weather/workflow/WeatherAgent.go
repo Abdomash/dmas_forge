@@ -8,13 +8,12 @@ import (
 
 	openai "github.com/openai/openai-go"
 	"github.com/vaastav/agentic_blueprint/ai_runtime/core"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
-var weatherToolTracer = otel.Tracer("github.com/vaastav/agentic_blueprint/examples/weather/workflow")
+const weatherToolTracerName = "github.com/vaastav/agentic_blueprint/examples/weather/workflow"
 
 type WeatherAgent interface {
 	Query(ctx context.Context, query string) (string, error)
@@ -67,7 +66,8 @@ func NewWeatherAgentImpl(ctx context.Context, agent core.Agent, disasterAgent Di
 }
 
 func toolHandler(ctx context.Context, toolcall openai.ChatCompletionMessageToolCall) (string, error) {
-	_, span := weatherToolTracer.Start(ctx, "tool.weather.get",
+	tracer := trace.SpanFromContext(ctx).TracerProvider().Tracer(weatherToolTracerName)
+	_, span := tracer.Start(ctx, "tool.weather.get",
 		trace.WithAttributes(
 			attribute.String("tool.name", toolcall.Function.Name),
 			attribute.String("provider_mode", "mock"),

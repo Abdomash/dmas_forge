@@ -1,0 +1,17 @@
+{
+  "input_tokens": 5811,
+  "jaeger_base_url": "http://localhost:12347",
+  "last_error": "",
+  "llm_call_spans": 14,
+  "output_tokens": 4516,
+  "services_queried": [
+    "unknown_service:wagent_proc",
+    "unknown_service:dagent_proc"
+  ],
+  "status": "ok",
+  "token_usage_available_spans": 14,
+  "total_tokens": 10327,
+  "traces_seen": 8,
+  "window_end_unix_seconds": 1777416513.416,
+  "window_start_unix_seconds": 1777416411.858
+}

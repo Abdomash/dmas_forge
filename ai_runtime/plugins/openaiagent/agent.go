@@ -7,7 +7,6 @@ import (
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	"github.com/vaastav/agentic_blueprint/ai_runtime/core"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -24,7 +23,7 @@ type OpenAILLMClient struct {
 	maxToolRounds int
 }
 
-var tracer = otel.Tracer("github.com/vaastav/agentic_blueprint/ai_runtime/plugins/openaiagent")
+const tracerName = "github.com/vaastav/agentic_blueprint/ai_runtime/plugins/openaiagent"
 
 // NewOpenAILLMClient creates a new OpenAI LLM client.
 // The maxToolRounds parameter specifies the maximum number of tool-call
@@ -60,6 +59,7 @@ func (c *OpenAILLMClient) AddTools(ctx context.Context, tooldefs map[string]open
 }
 
 func (c *OpenAILLMClient) LLMCall(ctx context.Context, query string) (string, error) {
+	tracer := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName)
 	ctx, span := tracer.Start(ctx, "llm.call",
 		trace.WithAttributes(
 			attribute.String("llm.provider", "openai"),
@@ -94,6 +94,7 @@ func (c *OpenAILLMClient) LLMCall(ctx context.Context, query string) (string, er
 const defaultMaxToolRounds = 10
 
 func (c *OpenAILLMClient) LLMCallWithTools(ctx context.Context, query string) (string, error) {
+	tracer := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName)
 	ctx, span := tracer.Start(ctx, "llm.call",
 		trace.WithAttributes(
 			attribute.String("llm.provider", "openai"),

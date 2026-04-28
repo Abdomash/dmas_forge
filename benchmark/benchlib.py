@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ADDRESS_RE = re.compile(r"^(?P<host>[^:]+):(?P<port>\d+)$")
 SERVICE_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_.-]+):\s*$")
 PORT_RE = re.compile(r'^      - ".*:(?P<internal>\d+)"\s*$')
+JAEGER_TRACE_LIMIT = 5000
 
 
 @dataclass(frozen=True)
@@ -192,13 +194,13 @@ def resolve_endpoint_and_wait(
             if remaining <= 0:
                 break
             attempts += 1
-            probe_url = build_url(endpoint, warmup_request)
+            probe_url = build_readiness_probe_url(endpoint)
             status, error, _, _ = perform_request(
                 probe_url, max(1.0, min(run.timeout, 5.0, remaining))
             )
             last_error = error
             last_status = status
-            if 200 <= status < 300 and error == "":
+            if status > 0:
                 consecutive[endpoint.url] = consecutive.get(endpoint.url, 0) + 1
                 if consecutive[endpoint.url] >= consecutive_successes:
                     metadata = StartupMetadata(
@@ -211,7 +213,7 @@ def resolve_endpoint_and_wait(
                         consecutive_successes_required=consecutive_successes,
                         wait_seconds=round(time.monotonic() - started, 3),
                         candidate_urls=candidate_urls,
-                        last_error=last_error,
+                        last_error="",
                         last_status=last_status,
                     )
                     return endpoint, metadata.to_dict()
@@ -248,36 +250,53 @@ def discover_candidate_endpoints(
         seen.add(candidate.url)
         candidates.append((source, candidate))
 
-    for source, port in discover_ports_from_compose(endpoint, build_dir):
-        candidate = endpoint_with_port(endpoint, port)
-        if candidate.url in seen:
-            continue
-        seen.add(candidate.url)
-        candidates.append((source, candidate))
+    if not candidates:
+        for source, port in discover_ports_from_compose(endpoint, build_dir):
+            candidate = endpoint_with_port(endpoint, port)
+            if candidate.url in seen:
+                continue
+            seen.add(candidate.url)
+            candidates.append((source, candidate))
 
-    if endpoint.url not in seen:
+    if not candidates and endpoint.url not in seen:
         candidates.append(("manifest", endpoint))
     return candidates
 
 
 def discover_ports_from_local_env(build_dir: Path) -> list[tuple[str, int]]:
-    env_file = build_dir / ".local.env"
-    if not env_file.exists():
-        return []
-
     ports: list[tuple[str, int]] = []
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        if not key.endswith("_BIND_ADDR"):
+    for key, value in load_local_env(build_dir).items():
+        if not key.endswith("_HTTP_BIND_ADDR"):
             continue
         parsed = parse_address_port(value)
         if parsed is None:
             continue
         ports.append((f"local_env:{key}", parsed))
-    return ports
+    if not ports:
+        return []
+    return [max(ports, key=lambda item: item[1])]
+
+
+def build_readiness_probe_url(endpoint: Endpoint) -> str:
+    parsed = urllib.parse.urlsplit(endpoint.url)
+    return urllib.parse.urlunsplit(
+        (parsed.scheme or "http", parsed.netloc, "/_benchmark_ready", "", "")
+    )
+
+
+def load_local_env(build_dir: Path) -> dict[str, str]:
+    env_file = build_dir / ".local.env"
+    if not env_file.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
 
 
 def discover_ports_from_compose(
@@ -292,7 +311,7 @@ def discover_ports_from_compose(
     for service, internal_port in parse_compose_service_ports(compose_file):
         try:
             proc = subprocess.run(
-                ["docker", "compose", "port", service, str(internal_port)],
+                compose_cmd(build_dir) + ["port", service, str(internal_port)],
                 cwd=compose_dir,
                 check=False,
                 capture_output=True,
@@ -373,11 +392,39 @@ def example_wiring_dir(example: str) -> Path:
     return path
 
 
+def shared_model_file() -> Path:
+    path = REPO_ROOT / "benchmark" / "example_model.json"
+    if not path.exists():
+        raise ValueError(f"missing benchmark model file: {path}")
+    return path
+
+
+def shared_financial_analyzer_mcp_servers_arg(build_args: list[str]) -> str | None:
+    if any(arg.startswith("-mcp-servers=") for arg in build_args):
+        return None
+
+    path = REPO_ROOT / "benchmark" / "financial_analyzer_mcp_servers.txt"
+    if not path.exists():
+        return None
+
+    servers = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not servers:
+        return None
+    return f"-mcp-servers={','.join(servers)}"
+
+
 def build_deployment(run: BenchmarkRun, output_dir: Path) -> None:
     wiring_dir = example_wiring_dir(run.example)
-    model_file = REPO_ROOT / "benchmark" / "example_model.json"
-    if not model_file.exists():
-        raise ValueError(f"missing benchmark model file: {model_file}")
+    output_dir = output_dir.resolve()
+    build_args = list(run.build_args)
+    if run.example == "financial-analyzer":
+        mcp_servers_arg = shared_financial_analyzer_mcp_servers_arg(build_args)
+        if mcp_servers_arg is not None:
+            build_args.append(mcp_servers_arg)
     cmd = [
         "go",
         "run",
@@ -386,28 +433,59 @@ def build_deployment(run: BenchmarkRun, output_dir: Path) -> None:
         run.mode,
         "-o",
         str(output_dir),
-        f"-modfile={model_file}",
-    ] + run.build_args
+        f"-modfile={shared_model_file()}",
+    ] + build_args
     subprocess.run(cmd, cwd=wiring_dir, check=True)
+    normalize_generated_go_modules(output_dir)
+
+
+def normalize_generated_go_modules(output_dir: Path) -> None:
+    desired_versions = {
+        "go.opentelemetry.io/otel": "v1.21.0",
+        "go.opentelemetry.io/otel/metric": "v1.21.0",
+        "go.opentelemetry.io/otel/trace": "v1.21.0",
+        "go.opentelemetry.io/otel/sdk": "v1.21.0",
+        "go.opentelemetry.io/otel/sdk/metric": "v1.21.0",
+    }
+
+    for go_mod in output_dir.rglob("go.mod"):
+        contents = go_mod.read_text(encoding="utf-8")
+        if "module blueprint/goproc/" not in contents:
+            continue
+
+        updated = contents
+        for module, version in desired_versions.items():
+            updated = re.sub(
+                rf"^(?P<indent>\s*){re.escape(module)}\s+v[^\s]+(?P<suffix>\s*//.*)?$",
+                rf"\g<indent>{module} {version}\g<suffix>",
+                updated,
+                flags=re.MULTILINE,
+            )
+
+        if updated == contents:
+            continue
+
+        go_mod.write_text(updated, encoding="utf-8")
+        subprocess.run(["go", "mod", "tidy"], cwd=go_mod.parent, check=True)
 
 
 def compose_up(build_dir: Path, env: dict[str, str]) -> None:
+    build_dir = build_dir.resolve()
     compose_dir = build_dir / "docker"
     compose_env = os.environ.copy()
     compose_env.update(env)
-    env_file = build_dir / ".local.env"
-    cmd = ["docker", "compose"]
-    if env_file.exists():
-        cmd += ["--env-file", str(env_file)]
+    cmd = compose_cmd(build_dir)
     subprocess.run(cmd + ["build"], cwd=compose_dir, env=compose_env, check=True)
     subprocess.run(cmd + ["up", "-d"], cwd=compose_dir, env=compose_env, check=True)
 
 
 def compose_down(build_dir: Path) -> None:
+    build_dir = build_dir.resolve()
     compose_dir = build_dir / "docker"
     if compose_dir.exists():
+        cmd = compose_cmd(build_dir)
         subprocess.run(
-            ["docker", "compose", "down", "--remove-orphans"],
+            cmd + ["down", "--remove-orphans"],
             cwd=compose_dir,
             check=False,
         )
@@ -430,14 +508,12 @@ def resolve_resource_targets(targets: list[str], build_dir: Path) -> list[str]:
 
 
 def discover_compose_container_ids(build_dir: Path) -> list[str]:
+    build_dir = build_dir.resolve()
     compose_dir = build_dir / "docker"
     if not compose_dir.exists():
         return []
 
-    env_file = build_dir / ".local.env"
-    cmd = ["docker", "compose"]
-    if env_file.exists():
-        cmd += ["--env-file", str(env_file)]
+    cmd = compose_cmd(build_dir)
 
     try:
         proc = subprocess.run(
@@ -453,6 +529,29 @@ def discover_compose_container_ids(build_dir: Path) -> list[str]:
     if proc.returncode != 0:
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def compose_cmd(build_dir: Path) -> list[str]:
+    build_dir = build_dir.resolve()
+    env_file = build_dir / ".local.env"
+    cmd = ["docker", "compose", "-p", compose_project_name(build_dir)]
+    if env_file.exists():
+        cmd += ["--env-file", str(env_file)]
+    return cmd
+
+
+def compose_project_name(build_dir: Path) -> str:
+    build_dir = build_dir.resolve()
+    run_name = sanitize_compose_project_part(build_dir.parent.name)
+    run_id = sanitize_compose_project_part(build_dir.parent.parent.name)
+    digest = hashlib.sha1(str(build_dir).encode("utf-8")).hexdigest()[:8]
+    project = f"benchmark-{run_id}-{run_name}-{digest}"
+    return project[:63].rstrip("-")
+
+
+def sanitize_compose_project_part(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9_-]+", "-", value.lower()).strip("-")
+    return cleaned or "run"
 
 
 def dedupe_preserving_order(values: list[str]) -> list[str]:
@@ -548,6 +647,206 @@ def sample_process(pattern: str) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def collect_jaeger_snapshot(
+    build_dir: Path, start_time_s: float, end_time_s: float
+) -> dict[str, Any]:
+    jaeger_base_url = discover_jaeger_base_url(build_dir)
+    snapshot: dict[str, Any] = {
+        "status": "unavailable",
+        "jaeger_base_url": jaeger_base_url or "",
+        "window_start_unix_seconds": round(start_time_s, 3),
+        "window_end_unix_seconds": round(end_time_s, 3),
+        "services_payload": {},
+        "traces_by_service": {},
+        "last_error": "",
+    }
+    if jaeger_base_url is None:
+        snapshot["last_error"] = "missing JAEGER_UI_BIND_ADDR"
+        return snapshot
+
+    start_us = int(max(0.0, start_time_s - 2.0) * 1_000_000)
+    end_us = int((end_time_s + 2.0) * 1_000_000)
+
+    for attempt in range(3):
+        try:
+            services_payload = fetch_json(f"{jaeger_base_url}/api/services")
+            services = [
+                str(service) for service in (services_payload.get("data") or [])
+            ]
+            traces_by_service: dict[str, dict[str, Any]] = {}
+            traces_found = 0
+            for service in services:
+                traces_payload = fetch_jaeger_traces(
+                    jaeger_base_url, service, start_us, end_us
+                )
+                traces_by_service[service] = traces_payload
+                traces_found += len(traces_payload.get("data") or [])
+
+            snapshot["services_payload"] = services_payload
+            snapshot["traces_by_service"] = traces_by_service
+            if traces_found > 0 or attempt == 2:
+                snapshot["status"] = "ok"
+                return snapshot
+        except Exception as exc:  # noqa: BLE001 - benchmark records collection failures.
+            snapshot["last_error"] = str(exc)
+            if attempt == 2:
+                return snapshot
+        time.sleep(0.5)
+
+    return snapshot
+
+
+def collect_token_usage(
+    build_dir: Path, start_time_s: float, end_time_s: float
+) -> dict[str, Any]:
+    snapshot = collect_jaeger_snapshot(build_dir, start_time_s, end_time_s)
+    return token_usage_from_jaeger_snapshot(snapshot)
+
+
+def discover_jaeger_base_url(build_dir: Path) -> str | None:
+    addr = load_local_env(build_dir).get("JAEGER_UI_BIND_ADDR", "")
+    port = parse_address_port(addr)
+    if port is None:
+        return None
+    return f"http://localhost:{port}"
+
+
+def fetch_json(url: str, timeout: float = 5.0) -> dict[str, Any]:
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_jaeger_traces(
+    jaeger_base_url: str, service: str, start_us: int, end_us: int
+) -> dict[str, Any]:
+    params = urllib.parse.urlencode(
+        {
+            "service": service,
+            "start": str(start_us),
+            "end": str(end_us),
+            "limit": str(JAEGER_TRACE_LIMIT),
+        }
+    )
+    return fetch_json(f"{jaeger_base_url}/api/traces?{params}")
+
+
+def token_usage_from_jaeger_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "status": snapshot.get("status", "unavailable"),
+        "jaeger_base_url": snapshot.get("jaeger_base_url", ""),
+        "window_start_unix_seconds": snapshot.get("window_start_unix_seconds", 0),
+        "window_end_unix_seconds": snapshot.get("window_end_unix_seconds", 0),
+        "services_queried": [
+            str(service)
+            for service in (snapshot.get("services_payload", {}).get("data") or [])
+        ],
+        "traces_seen": 0,
+        "llm_call_spans": 0,
+        "token_usage_available_spans": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "last_error": snapshot.get("last_error", ""),
+    }
+    seen_traces: set[str] = set()
+    seen_spans: set[tuple[str, str]] = set()
+
+    for traces_payload in snapshot.get("traces_by_service", {}).values():
+        for trace in traces_payload.get("data") or []:
+            trace_id = str(trace.get("traceID", ""))
+            if trace_id:
+                seen_traces.add(trace_id)
+            for span in trace.get("spans") or []:
+                span_id = str(span.get("spanID", ""))
+                span_key = (trace_id, span_id)
+                if span_key in seen_spans:
+                    continue
+                seen_spans.add(span_key)
+
+                tags = span_tags(span)
+                if not has_llm_token_tags(tags):
+                    continue
+
+                summary["llm_call_spans"] += 1
+                if parse_bool(tags.get("llm.token_usage_available")):
+                    summary["token_usage_available_spans"] += 1
+                summary["input_tokens"] += parse_int(tags.get("llm.input_tokens"))
+                summary["output_tokens"] += parse_int(tags.get("llm.output_tokens"))
+                summary["total_tokens"] += parse_int(tags.get("llm.total_tokens"))
+
+    summary["traces_seen"] = len(seen_traces)
+    return summary
+
+
+def write_jaeger_snapshot(path: Path, snapshot: dict[str, Any]) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "status": snapshot.get("status", "unavailable"),
+        "jaeger_base_url": snapshot.get("jaeger_base_url", ""),
+        "window_start_unix_seconds": snapshot.get("window_start_unix_seconds", 0),
+        "window_end_unix_seconds": snapshot.get("window_end_unix_seconds", 0),
+        "last_error": snapshot.get("last_error", ""),
+        "services": [
+            str(service)
+            for service in (snapshot.get("services_payload", {}).get("data") or [])
+        ],
+    }
+    write_json(path / "metadata.json", metadata)
+    write_json(path / "services.json", snapshot.get("services_payload", {}))
+    for service, traces_payload in sorted(
+        snapshot.get("traces_by_service", {}).items()
+    ):
+        write_json(path / f"traces-{sanitize_filename(service)}.json", traces_payload)
+
+
+def sanitize_filename(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-.")
+    return cleaned or "value"
+
+
+def span_tags(span: dict[str, Any]) -> dict[str, Any]:
+    tags: dict[str, Any] = {}
+    for tag in span.get("tags") or []:
+        key = tag.get("key")
+        if not key:
+            continue
+        tags[str(key)] = tag.get("value")
+    return tags
+
+
+def has_llm_token_tags(tags: dict[str, Any]) -> bool:
+    return any(
+        key in tags
+        for key in (
+            "llm.token_usage_available",
+            "llm.input_tokens",
+            "llm.output_tokens",
+            "llm.total_tokens",
+        )
+    )
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return False
+
+
+def parse_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return 0
+    return 0
 
 
 def run_profile(
@@ -658,6 +957,10 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def load_result_rows(result_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in sorted(result_dir.glob("**/requests-repeat-*.jsonl")):
@@ -669,7 +972,35 @@ def load_result_rows(result_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def aggregate_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def load_token_usage_rows(result_dir: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in sorted(result_dir.glob("**/token_usage.json")):
+        run_path = path.parent / "run.json"
+        if not run_path.exists():
+            continue
+        run = json.loads(run_path.read_text(encoding="utf-8"))
+        token_usage = json.loads(path.read_text(encoding="utf-8"))
+        rows.append(
+            {
+                "example": run["example"],
+                "mode": run["mode"],
+                "profile": run["profile"],
+                "provider_mode": run.get("provider_mode", ""),
+                "llm_call_spans": int(token_usage.get("llm_call_spans", 0)),
+                "token_usage_available_spans": int(
+                    token_usage.get("token_usage_available_spans", 0)
+                ),
+                "input_tokens": int(token_usage.get("input_tokens", 0)),
+                "output_tokens": int(token_usage.get("output_tokens", 0)),
+                "total_tokens": int(token_usage.get("total_tokens", 0)),
+            }
+        )
+    return rows
+
+
+def aggregate_results(
+    rows: list[dict[str, Any]], token_rows: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
     for row in rows:
         key = (
@@ -680,9 +1011,40 @@ def aggregate_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
         groups.setdefault(key, []).append(row)
 
+    token_groups: dict[tuple[str, str, str, str], dict[str, int]] = {}
+    for row in token_rows or []:
+        key = (
+            row["example"],
+            row["mode"],
+            row["profile"],
+            row.get("provider_mode", ""),
+        )
+        token_group = token_groups.setdefault(
+            key,
+            {
+                "llm_call_spans": 0,
+                "token_usage_available_spans": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        )
+        for field in token_group:
+            token_group[field] += int(row.get(field, 0))
+
     summaries: list[dict[str, Any]] = []
     for (example, mode, profile, provider_mode), group in sorted(groups.items()):
         latencies = sorted(float(row["latency_ms"]) for row in group if row.get("ok"))
+        token_group = token_groups.get(
+            (example, mode, profile, provider_mode),
+            {
+                "llm_call_spans": 0,
+                "token_usage_available_spans": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        )
         summaries.append(
             {
                 "example": example,
@@ -695,6 +1057,7 @@ def aggregate_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "p50_ms": percentile(latencies, 50),
                 "p95_ms": percentile(latencies, 95),
                 "p99_ms": percentile(latencies, 99),
+                **token_group,
             }
         )
     return summaries
@@ -723,6 +1086,11 @@ def write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "requests",
         "successes",
         "errors",
+        "llm_call_spans",
+        "token_usage_available_spans",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
         "p50_ms",
         "p95_ms",
         "p99_ms",
@@ -737,12 +1105,12 @@ def write_summary_md(path: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# Benchmark Summary",
         "",
-        "| Example | Mode | Profile | Provider | Requests | Successes | Errors | p50 ms | p95 ms | p99 ms |",
-        "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
+        "| Example | Mode | Profile | Provider | Requests | Successes | Errors | LLM spans | Token spans | Input tokens | Output tokens | Total tokens | p50 ms | p95 ms | p99 ms |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            "| {example} | {mode} | {profile} | {provider_mode} | {requests} | {successes} | {errors} | {p50_ms:.2f} | {p95_ms:.2f} | {p99_ms:.2f} |".format(
+            "| {example} | {mode} | {profile} | {provider_mode} | {requests} | {successes} | {errors} | {llm_call_spans} | {token_usage_available_spans} | {input_tokens} | {output_tokens} | {total_tokens} | {p50_ms:.2f} | {p95_ms:.2f} | {p99_ms:.2f} |".format(
                 **row
             )
         )

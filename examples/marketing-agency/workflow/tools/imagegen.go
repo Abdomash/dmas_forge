@@ -17,7 +17,6 @@ import (
 
 	openai "github.com/openai/openai-go"
 	"github.com/vaastav/agentic_blueprint/ai_runtime/core"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -28,7 +27,7 @@ const (
 	imageProviderMock = "mock"
 )
 
-var imageTracer = otel.Tracer("github.com/vaastav/agentic_blueprint/examples/marketing-agency/workflow/tools/imagegen")
+const imageTracerName = "github.com/vaastav/agentic_blueprint/examples/marketing-agency/workflow/tools/imagegen"
 
 type ImageProvider interface {
 	Mode() string
@@ -112,7 +111,8 @@ func ImageGenHandler(client *openai.Client) core.ToolHandlerFn {
 
 func ImageGenHandlerWithProvider(provider ImageProvider) core.ToolHandlerFn {
 	return func(ctx context.Context, tc openai.ChatCompletionMessageToolCall) (string, error) {
-		ctx, span := imageTracer.Start(ctx, "tool.image.generate",
+		tracer := trace.SpanFromContext(ctx).TracerProvider().Tracer(imageTracerName)
+		ctx, span := tracer.Start(ctx, "tool.image.generate",
 			trace.WithAttributes(
 				attribute.String("tool.name", "generate_image"),
 				attribute.String("provider_mode", provider.Mode()),

@@ -1,0 +1,16 @@
+{
+  "input_tokens": 881,
+  "jaeger_base_url": "http://localhost:12346",
+  "last_error": "",
+  "llm_call_spans": 2,
+  "output_tokens": 718,
+  "services_queried": [
+    "unknown_service:wagent_proc"
+  ],
+  "status": "ok",
+  "token_usage_available_spans": 2,
+  "total_tokens": 1599,
+  "traces_seen": 1,
+  "window_end_unix_seconds": 1777416308.318,
+  "window_start_unix_seconds": 1777416293.497
+}

@@ -10,13 +10,12 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	openai "github.com/openai/openai-go"
 	"github.com/vaastav/agentic_blueprint/ai_runtime/core"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
-var mcpBridgeTracer = otel.Tracer("github.com/vaastav/agentic_blueprint/examples/financial-analyzer/workflow/mcp_bridge")
+const mcpBridgeTracerName = "github.com/vaastav/agentic_blueprint/examples/financial-analyzer/workflow/mcp_bridge"
 
 type MCPToolBridge struct {
 	sessions  []*mcp.ClientSession
@@ -39,7 +38,8 @@ func NewMCPToolBridge(ctx context.Context, serverURLs []string) (*MCPToolBridge,
 		if url == "" {
 			continue
 		}
-		serverCtx, span := mcpBridgeTracer.Start(ctx, "mcp.discovery",
+		tracer := trace.SpanFromContext(ctx).TracerProvider().Tracer(mcpBridgeTracerName)
+		serverCtx, span := tracer.Start(ctx, "mcp.discovery",
 			trace.WithAttributes(
 				attribute.String("mcp.server_url", url),
 				attribute.String("provider_mode", "external"),
@@ -108,7 +108,8 @@ func (b *MCPToolBridge) AddToolsToAgent(ctx context.Context, agent core.Agent) e
 }
 
 func (b *MCPToolBridge) HandleToolCall(ctx context.Context, tc openai.ChatCompletionMessageToolCall) (string, error) {
-	ctx, span := mcpBridgeTracer.Start(ctx, "mcp.tool_call",
+	tracer := trace.SpanFromContext(ctx).TracerProvider().Tracer(mcpBridgeTracerName)
+	ctx, span := tracer.Start(ctx, "mcp.tool_call",
 		trace.WithAttributes(
 			attribute.String("tool.name", tc.Function.Name),
 			attribute.String("provider_mode", "external"),

@@ -15,7 +15,6 @@ import (
 
 	openai "github.com/openai/openai-go"
 	"github.com/vaastav/agentic_blueprint/ai_runtime/core"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -26,7 +25,7 @@ const (
 	searchProviderMock = "mock"
 )
 
-var searchTracer = otel.Tracer("github.com/vaastav/agentic_blueprint/examples/marketing-agency/workflow/tools/search")
+const searchTracerName = "github.com/vaastav/agentic_blueprint/examples/marketing-agency/workflow/tools/search"
 
 type SearchProvider interface {
 	Mode() string
@@ -112,7 +111,8 @@ func DuckDuckGoSearchHandler() core.ToolHandlerFn {
 
 func DuckDuckGoSearchHandlerWithProvider(provider SearchProvider) core.ToolHandlerFn {
 	return func(ctx context.Context, tc openai.ChatCompletionMessageToolCall) (string, error) {
-		ctx, span := searchTracer.Start(ctx, "tool.search",
+		tracer := trace.SpanFromContext(ctx).TracerProvider().Tracer(searchTracerName)
+		ctx, span := tracer.Start(ctx, "tool.search",
 			trace.WithAttributes(
 				attribute.String("tool.name", "duckduckgo_search"),
 				attribute.String("provider_mode", provider.Mode()),

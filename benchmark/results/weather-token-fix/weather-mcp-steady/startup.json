@@ -1,0 +1,15 @@
+{
+  "attempts": 3,
+  "candidate_urls": [
+    "http://localhost:12348/Query"
+  ],
+  "consecutive_successes_required": 2,
+  "discovery_source": "local_env:WAGENT_SERVICE_HTTP_BIND_ADDR",
+  "last_error": "",
+  "last_status": 404,
+  "original_manifest_url": "http://localhost:12346/Query",
+  "readiness_request_id": "london",
+  "resolved_runtime_url": "http://localhost:12348/Query",
+  "status": "ready",
+  "wait_seconds": 1.007
+}

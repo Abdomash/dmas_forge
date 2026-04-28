@@ -1,6 +1,7 @@
 go 1.23.0
 
 use (
+	./benchmark/mock_mcp_server
 	./ai_plugins
 	./ai_runtime
 	./examples/chat/wiring

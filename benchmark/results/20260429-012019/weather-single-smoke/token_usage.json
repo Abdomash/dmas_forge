@@ -1,0 +1,14 @@
+{
+  "input_tokens": 0,
+  "jaeger_base_url": "http://localhost:12346",
+  "last_error": "",
+  "llm_call_spans": 0,
+  "output_tokens": 0,
+  "services_queried": [],
+  "status": "ok",
+  "token_usage_available_spans": 0,
+  "total_tokens": 0,
+  "traces_seen": 0,
+  "window_end_unix_seconds": 1777414896.457,
+  "window_start_unix_seconds": 1777414884.514
+}

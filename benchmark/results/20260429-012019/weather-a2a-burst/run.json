@@ -1,0 +1,16 @@
+{
+  "build_args": [],
+  "concurrency": 5,
+  "duration": 15.0,
+  "endpoint": "Endpoint(method='GET', url='http://localhost:12346/Query', params={})",
+  "example": "weather",
+  "mode": "a2a",
+  "profile": "burst",
+  "provider_mode": "mock",
+  "repeats": 3,
+  "requests": "/home/abdo/dmas_forge/benchmark/requests/weather.jsonl",
+  "resource_targets": [
+    "docker"
+  ],
+  "timeout": 120.0
+}

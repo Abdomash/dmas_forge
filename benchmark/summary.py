@@ -3,7 +3,13 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from benchmark.benchlib import aggregate_results, load_result_rows, write_summary_csv, write_summary_md
+from benchmark.benchlib import (
+    aggregate_results,
+    load_result_rows,
+    load_token_usage_rows,
+    write_summary_csv,
+    write_summary_md,
+)
 
 
 def main() -> int:
@@ -14,7 +20,9 @@ def main() -> int:
 
     out = args.out or args.results
     out.mkdir(parents=True, exist_ok=True)
-    rows = aggregate_results(load_result_rows(args.results))
+    rows = aggregate_results(
+        load_result_rows(args.results), load_token_usage_rows(args.results)
+    )
     write_summary_csv(out / "summary.csv", rows)
     write_summary_md(out / "summary.md", rows)
     return 0

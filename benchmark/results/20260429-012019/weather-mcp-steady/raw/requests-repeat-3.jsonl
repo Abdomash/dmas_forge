@@ -1,0 +1,2 @@
+{"error": "", "example": "weather", "latency_ms": 13020.658313998865, "mode": "mcp", "ok": true, "profile": "steady", "provider_mode": "mock", "repeat": 3, "request_id": "london", "response_bytes": 1528, "sequence": 0, "status": 200, "trace_id": ""}
+{"error": "", "example": "weather", "latency_ms": 17753.009340998688, "mode": "mcp", "ok": true, "profile": "steady", "provider_mode": "mock", "repeat": 3, "request_id": "riyadh", "response_bytes": 1774, "sequence": 1, "status": 200, "trace_id": ""}

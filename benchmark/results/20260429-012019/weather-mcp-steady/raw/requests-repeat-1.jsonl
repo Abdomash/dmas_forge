@@ -1,0 +1,3 @@
+{"error": "", "example": "weather", "latency_ms": 13839.591488998849, "mode": "mcp", "ok": true, "profile": "steady", "provider_mode": "mock", "repeat": 1, "request_id": "london", "response_bytes": 1345, "sequence": 0, "status": 200, "trace_id": ""}
+{"error": "", "example": "weather", "latency_ms": 12016.890571998374, "mode": "mcp", "ok": true, "profile": "steady", "provider_mode": "mock", "repeat": 1, "request_id": "riyadh", "response_bytes": 1755, "sequence": 1, "status": 200, "trace_id": ""}
+{"error": "", "example": "weather", "latency_ms": 13102.81486399981, "mode": "mcp", "ok": true, "profile": "steady", "provider_mode": "mock", "repeat": 1, "request_id": "tokyo", "response_bytes": 1427, "sequence": 2, "status": 200, "trace_id": ""}

@@ -1,0 +1,3 @@
+{"error": "", "example": "weather", "latency_ms": 14560.27896100204, "mode": "docker", "ok": true, "profile": "steady", "provider_mode": "mock", "repeat": 3, "request_id": "london", "response_bytes": 2284, "sequence": 0, "status": 200, "trace_id": ""}
+{"error": "", "example": "weather", "latency_ms": 10877.429696000036, "mode": "docker", "ok": true, "profile": "steady", "provider_mode": "mock", "repeat": 3, "request_id": "riyadh", "response_bytes": 1475, "sequence": 1, "status": 200, "trace_id": ""}
+{"error": "", "example": "weather", "latency_ms": 12868.98536499939, "mode": "docker", "ok": true, "profile": "steady", "provider_mode": "mock", "repeat": 3, "request_id": "tokyo", "response_bytes": 1644, "sequence": 2, "status": 200, "trace_id": ""}

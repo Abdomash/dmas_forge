@@ -1,0 +1,1 @@
+{"error": "", "example": "weather", "latency_ms": 13434.238854999421, "mode": "single", "ok": true, "profile": "smoke", "provider_mode": "mock", "repeat": 1, "request_id": "london", "response_bytes": 2199, "sequence": 0, "status": 200, "trace_id": ""}

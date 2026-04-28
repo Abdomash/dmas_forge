@@ -1,5 +1,5 @@
 {
-  "name": "gpt-5.4-nano",
-  "url": "https://api.openai.com/v1",
-  "key": "your-api-key-here"
+  "name": "gpt-oss-120b",
+  "url": "http://172.27.41.239:30001/v1",
+  "key": ""
 }
