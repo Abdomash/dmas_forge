@@ -10,7 +10,13 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	openai "github.com/openai/openai-go"
 	"github.com/vaastav/agentic_blueprint/ai_runtime/core"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var mcpBridgeTracer = otel.Tracer("github.com/vaastav/agentic_blueprint/examples/financial-analyzer/workflow/mcp_bridge")
 
 type MCPToolBridge struct {
 	sessions  []*mcp.ClientSession
@@ -33,26 +39,41 @@ func NewMCPToolBridge(ctx context.Context, serverURLs []string) (*MCPToolBridge,
 		if url == "" {
 			continue
 		}
+		serverCtx, span := mcpBridgeTracer.Start(ctx, "mcp.discovery",
+			trace.WithAttributes(
+				attribute.String("mcp.server_url", url),
+				attribute.String("provider_mode", "external"),
+			),
+		)
 
 		client := mcp.NewClient(&mcp.Implementation{
 			Name:    "financial-analyzer-mcp-bridge",
 			Version: "1.0.0",
 		}, nil)
 
-		session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		session, err := client.Connect(serverCtx, &mcp.StreamableClientTransport{
 			Endpoint: url,
 		}, nil)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			span.End()
 			log.Printf("MCP bridge: failed to connect to server %s: %v", url, err)
 			continue
 		}
 
-		result, err := session.ListTools(ctx, nil)
+		result, err := session.ListTools(serverCtx, nil)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			span.End()
 			log.Printf("MCP bridge: failed to list tools from %s: %v", url, err)
 			_ = session.Close()
 			continue
 		}
+		span.SetAttributes(attribute.Int("mcp.tool_count", len(result.Tools)))
+		span.SetStatus(codes.Ok, "")
+		span.End()
 
 		idx := len(b.sessions)
 		b.sessions = append(b.sessions, session)
@@ -87,14 +108,26 @@ func (b *MCPToolBridge) AddToolsToAgent(ctx context.Context, agent core.Agent) e
 }
 
 func (b *MCPToolBridge) HandleToolCall(ctx context.Context, tc openai.ChatCompletionMessageToolCall) (string, error) {
+	ctx, span := mcpBridgeTracer.Start(ctx, "mcp.tool_call",
+		trace.WithAttributes(
+			attribute.String("tool.name", tc.Function.Name),
+			attribute.String("provider_mode", "external"),
+		),
+	)
+	defer span.End()
+
 	idx, ok := b.toolToIdx[tc.Function.Name]
 	if !ok {
+		span.SetStatus(codes.Error, "tool not found")
 		return fmt.Sprintf("Error: tool %q not found in MCP bridge", tc.Function.Name), nil
 	}
+	span.SetAttributes(attribute.Int("mcp.session_index", idx))
 
 	var args map[string]any
 	if tc.Function.Arguments != "" {
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return "", fmt.Errorf("parsing tool call arguments for %q: %w", tc.Function.Name, err)
 		}
 	}
@@ -107,6 +140,8 @@ func (b *MCPToolBridge) HandleToolCall(ctx context.Context, tc openai.ChatComple
 		Arguments: args,
 	})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return fmt.Sprintf("Error calling MCP tool %q: %v", tc.Function.Name, err), nil
 	}
 
@@ -122,7 +157,11 @@ func (b *MCPToolBridge) HandleToolCall(ctx context.Context, tc openai.ChatComple
 	output := strings.Join(parts, "\n")
 	if result.IsError && output != "" {
 		output = "Error from MCP server: " + output
+		span.SetStatus(codes.Error, "mcp tool returned error")
+	} else {
+		span.SetStatus(codes.Ok, "")
 	}
+	span.SetAttributes(attribute.Bool("mcp.tool_is_error", result.IsError))
 	return output, nil
 }
 

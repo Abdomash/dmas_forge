@@ -6,15 +6,20 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.3.0
 	github.com/openai/openai-go v1.11.1
 	github.com/vaastav/agentic_blueprint/ai_runtime v0.0.0
+	go.opentelemetry.io/otel v1.26.0
 )
 
 require (
+	github.com/go-logr/logr v1.4.1 // indirect
+	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/tidwall/gjson v1.14.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
+	go.opentelemetry.io/otel/metric v1.26.0 // indirect
+	go.opentelemetry.io/otel/trace v1.26.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
 )
 
