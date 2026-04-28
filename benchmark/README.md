@@ -49,12 +49,9 @@ These summaries report:
 
 ## How To Run It
 
-1. Configure the model file for each example used by the manifest:
+1. Configure the shared benchmark model file:
 
-- `examples/weather/wiring/example_model.json`
-- `examples/marketing-agency/wiring/example_model.json`
-- `examples/travel-planning/wiring/example_model.json`
-- `examples/financial-analyzer/wiring/example_model.json`
+- `benchmark/example_model.json`
 
 2. Make sure Docker and Docker Compose are available.
 

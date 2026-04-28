@@ -375,6 +375,9 @@ def example_wiring_dir(example: str) -> Path:
 
 def build_deployment(run: BenchmarkRun, output_dir: Path) -> None:
     wiring_dir = example_wiring_dir(run.example)
+    model_file = REPO_ROOT / "benchmark" / "example_model.json"
+    if not model_file.exists():
+        raise ValueError(f"missing benchmark model file: {model_file}")
     cmd = [
         "go",
         "run",
@@ -383,7 +386,7 @@ def build_deployment(run: BenchmarkRun, output_dir: Path) -> None:
         run.mode,
         "-o",
         str(output_dir),
-        "-modfile=./example_model.json",
+        f"-modfile={model_file}",
     ] + run.build_args
     subprocess.run(cmd, cwd=wiring_dir, check=True)
 
