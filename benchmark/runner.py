@@ -13,6 +13,7 @@ from benchmark.benchlib import (
     load_manifest,
     load_requests,
     provider_env,
+    resolve_resource_targets,
     resolve_endpoint_and_wait,
     run_profile,
     start_resource_sampler,
@@ -64,7 +65,13 @@ def main() -> int:
                     f"startup readiness failed for {name}: {startup.get('last_error') or startup.get('status')}"
                 )
 
-            resolved_run = replace(run, endpoint=resolved_endpoint)
+            resolved_run = replace(
+                run,
+                endpoint=resolved_endpoint,
+                resource_targets=resolve_resource_targets(
+                    run.resource_targets, build_dir
+                ),
+            )
             stop, thread = start_resource_sampler(
                 resolved_run, run_dir / "raw" / "resources.jsonl"
             )

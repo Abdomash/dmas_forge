@@ -8,6 +8,7 @@ import statistics
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -409,6 +410,59 @@ def compose_down(build_dir: Path) -> None:
         )
 
 
+def resolve_resource_targets(targets: list[str], build_dir: Path) -> list[str]:
+    resolved: list[str] = []
+    for target in targets:
+        if target != "docker":
+            resolved.append(target)
+            continue
+
+        container_ids = discover_compose_container_ids(build_dir)
+        if not container_ids:
+            resolved.append(target)
+            continue
+
+        resolved.extend(f"container:{container_id}" for container_id in container_ids)
+    return dedupe_preserving_order(resolved)
+
+
+def discover_compose_container_ids(build_dir: Path) -> list[str]:
+    compose_dir = build_dir / "docker"
+    if not compose_dir.exists():
+        return []
+
+    env_file = build_dir / ".local.env"
+    cmd = ["docker", "compose"]
+    if env_file.exists():
+        cmd += ["--env-file", str(env_file)]
+
+    try:
+        proc = subprocess.run(
+            cmd + ["ps", "-q"],
+            cwd=compose_dir,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []
+
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def dedupe_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
 def start_resource_sampler(
     run: BenchmarkRun, out_path: Path, interval: float = 1.0
 ) -> tuple[threading.Event, threading.Thread]:
@@ -582,6 +636,13 @@ def perform_request(url: str, timeout: float) -> tuple[int, str, int, float]:
             body = resp.read()
             status = resp.status
             size = len(body)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        error = str(exc)
+        try:
+            size = len(exc.read())
+        except Exception:
+            size = 0
     except Exception as exc:  # noqa: BLE001 - benchmark records all failures.
         error = str(exc)
     latency_ms = (time.perf_counter() - started) * 1000.0
