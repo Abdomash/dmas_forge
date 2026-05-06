@@ -26,6 +26,7 @@ Several example applications are provided in the [`examples/`](examples/) direct
 | [marketing-agency](examples/marketing-agency/) | Multi-agent marketing campaign coordinator | 5 (Coordinator, DomainAgent, WebsiteAgent, MarketingAgent, LogoAgent) | Inter-agent delegation, tool use (TCP domain checks), OpenAI images API |
 | [travel-planning](examples/travel-planning/) | AutoGen-style multi-agent travel planning with round-robin termination | 5 (Coordinator + 4 specialists) | Round-robin orchestration, shared transcript context, `TERMINATE` stop condition |
 | [financial-analyzer](examples/financial-analyzer/) | Multi-agent financial analysis with research refinement loop | 6 (Coordinator, DataCollector, DataEvaluator, ResearchQualityController, FinancialAnalyst, ReportWriter) | Pluggable MCP Servers, Evaluator-Optimizer loop, multiple wiring specs (single, HTTP, MCP, A2A) |
+| [agentic-hotel](examples/agentic-hotel/) | Simplified agentic hotel reservation with advisor/support agents | 2 (HotelAdvisorAgent + SupportAgent) | Traditional services, frontend routing, RAG support, tool-using advisor, multiple wiring specs |
 
 Each example has its own README with setup and usage instructions.
 
