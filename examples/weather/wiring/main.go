@@ -10,7 +10,8 @@ func main() {
 	name := "weather"
 	cmdbuilder.MakeAndExecute(
 		name,
-		specs.Docker,
+		specs.Single,
+		specs.HTTP,
 		specs.A2A,
 		specs.MCP,
 	)

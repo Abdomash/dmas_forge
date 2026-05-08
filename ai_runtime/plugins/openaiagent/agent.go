@@ -2,35 +2,44 @@ package openaiagent
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	"github.com/vaastav/agentic_blueprint/ai_runtime/core"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type OpenAILLMClient struct {
-	hasSysMsg     bool
-	tool_map      map[string]openai.ChatCompletionToolParam
-	tools         []openai.ChatCompletionToolParam
-	sysMsg        string
-	client        *openai.Client
-	model         string
-	toolHandlerFn core.ToolHandlerFn
-	maxToolRounds int
+	hasSysMsg              bool
+	tool_map               map[string]openai.ChatCompletionToolParam
+	tools                  []openai.ChatCompletionToolParam
+	sysMsg                 string
+	client                 *openai.Client
+	model                  string
+	toolHandlerFn          core.ToolHandlerFn
+	maxToolRounds          int
+	failOnToolHandlerError bool
 }
 
 // NewOpenAILLMClient creates a new OpenAI LLM client.
 // The maxToolRounds parameter specifies the maximum number of tool-call
 // round-trips allowed in a single LLMCallWithTools invocation.
 // If maxToolRounds is empty, unparseable, 0, or negative, the default value of 10 is used.
-func NewOpenAILLMClient(ctx context.Context, url string, apikey string, model_name string, maxToolRounds string) (*OpenAILLMClient, error) {
+func NewOpenAILLMClient(ctx context.Context, url string, apikey string, model_name string, maxToolRounds string, failOnToolHandlerError string) (*OpenAILLMClient, error) {
 	client := openai.NewClient(option.WithBaseURL(url), option.WithAPIKey(apikey))
 	maxRounds, err := strconv.Atoi(maxToolRounds)
 	if err != nil || maxRounds <= 0 {
 		maxRounds = defaultMaxToolRounds
 	}
-	return &OpenAILLMClient{client: &client, tool_map: make(map[string]openai.ChatCompletionToolParam), model: model_name, maxToolRounds: maxRounds}, nil
+	failFast, err := strconv.ParseBool(failOnToolHandlerError)
+	if err != nil {
+		failFast = false
+	}
+	return &OpenAILLMClient{client: &client, tool_map: make(map[string]openai.ChatCompletionToolParam), model: model_name, maxToolRounds: maxRounds, failOnToolHandlerError: failFast}, nil
 }
 
 func (c *OpenAILLMClient) AddSystemPrompt(ctx context.Context, prompt string) error {
@@ -54,6 +63,17 @@ func (c *OpenAILLMClient) AddTools(ctx context.Context, tooldefs map[string]open
 }
 
 func (c *OpenAILLMClient) LLMCall(ctx context.Context, query string) (string, error) {
+	tracer := trace.SpanFromContext(ctx).TracerProvider().Tracer("github.com/vaastav/agentic_blueprint/ai_runtime/plugins/openaiagent")
+	ctx, span := tracer.Start(ctx, "llm.call",
+		trace.WithAttributes(
+			attribute.String("llm.provider", "openai"),
+			attribute.String("llm.model", c.model),
+			attribute.String("llm.call_type", "LLMCall"),
+			attribute.Bool("llm.tools_enabled", false),
+		),
+	)
+	defer span.End()
+
 	params := openai.ChatCompletionNewParams{
 		Messages: []openai.ChatCompletionMessageParamUnion{
 			openai.SystemMessage(c.sysMsg),
@@ -64,9 +84,16 @@ func (c *OpenAILLMClient) LLMCall(ctx context.Context, query string) (string, er
 
 	completion, err := c.client.Chat.Completions.New(ctx, params)
 	if err != nil {
+		recordSpanError(span, err)
 		return "", err
 	}
-	return completion.Choices[0].Message.Content, nil
+	setTokenAttributes(span, completion.Usage)
+	choice, err := firstChoice(completion)
+	if err != nil {
+		recordSpanError(span, err)
+		return "", err
+	}
+	return choice.Message.Content, nil
 }
 
 // defaultMaxToolRounds is the default maximum number of tool-call round-trips
@@ -76,6 +103,19 @@ func (c *OpenAILLMClient) LLMCall(ctx context.Context, query string) (string, er
 const defaultMaxToolRounds = 10
 
 func (c *OpenAILLMClient) LLMCallWithTools(ctx context.Context, query string) (string, error) {
+	tracer := trace.SpanFromContext(ctx).TracerProvider().Tracer("github.com/vaastav/agentic_blueprint/ai_runtime/plugins/openaiagent")
+	ctx, span := tracer.Start(ctx, "llm.call",
+		trace.WithAttributes(
+			attribute.String("llm.provider", "openai"),
+			attribute.String("llm.model", c.model),
+			attribute.String("llm.call_type", "LLMCallWithTools"),
+			attribute.Bool("llm.tools_enabled", true),
+			attribute.Int("llm.tool_count", len(c.tools)),
+			attribute.Int("llm.max_tool_rounds", c.maxToolRounds),
+		),
+	)
+	defer span.End()
+
 	params := openai.ChatCompletionNewParams{
 		Messages: []openai.ChatCompletionMessageParamUnion{
 			openai.SystemMessage(c.sysMsg),
@@ -85,25 +125,71 @@ func (c *OpenAILLMClient) LLMCallWithTools(ctx context.Context, query string) (s
 		Model: c.model,
 	}
 
-	for range c.maxToolRounds {
+	var inputTokens int64
+	var outputTokens int64
+	var totalTokens int64
+	tokenUsageAvailable := false
+	toolCallCount := 0
+	toolCallErrorCount := 0
+
+	for round := range c.maxToolRounds {
 		completion, err := c.client.Chat.Completions.New(ctx, params)
 		if err != nil {
+			recordSpanError(span, err)
+			return "", err
+		}
+		if hasTokenUsage(completion.Usage) {
+			tokenUsageAvailable = true
+			inputTokens += completion.Usage.PromptTokens
+			outputTokens += completion.Usage.CompletionTokens
+			totalTokens += completion.Usage.TotalTokens
+		}
+
+		choice, err := firstChoice(completion)
+		if err != nil {
+			recordSpanError(span, err)
 			return "", err
 		}
 
-		toolCalls := completion.Choices[0].Message.ToolCalls
+		toolCalls := choice.Message.ToolCalls
 		if len(toolCalls) == 0 {
-			return completion.Choices[0].Message.Content, nil
+			setAggregatedTokenAttributes(span, tokenUsageAvailable, inputTokens, outputTokens, totalTokens)
+			span.SetAttributes(
+				attribute.Int("llm.tool_call_count", toolCallCount),
+				attribute.Int("llm.tool_call_error_count", toolCallErrorCount),
+			)
+			return choice.Message.Content, nil
 		}
 
 		// Handle tool calls and continue the conversation
-		params.Messages = append(params.Messages, completion.Choices[0].Message.ToParam())
+		params.Messages = append(params.Messages, choice.Message.ToParam())
 		for _, toolCall := range toolCalls {
-			res, err := c.toolHandlerFn(ctx, toolCall)
+			toolCallCount++
+			toolCtx, toolSpan := tracer.Start(ctx, "llm.tool_call",
+				trace.WithAttributes(
+					attribute.String("tool.name", toolCall.Function.Name),
+					attribute.String("tool.id", toolCall.ID),
+					attribute.Int("tool.round", round+1),
+				),
+			)
+			res, err := c.toolHandlerFn(toolCtx, toolCall)
 			if err != nil {
-				// Abort if the tool handler function was unable to handle the tool call
-				return "", err
+				recordSpanError(toolSpan, err)
+				toolSpan.End()
+				toolCallErrorCount++
+				if c.failOnToolHandlerError || round == c.maxToolRounds-1 {
+					span.SetAttributes(
+						attribute.Int("llm.tool_call_count", toolCallCount),
+						attribute.Int("llm.tool_call_error_count", toolCallErrorCount),
+					)
+					recordSpanError(span, err)
+					return "", err
+				}
+				params.Messages = append(params.Messages, openai.ToolMessage("Error: "+err.Error(), toolCall.ID))
+				continue
 			}
+			toolSpan.SetStatus(codes.Ok, "")
+			toolSpan.End()
 			params.Messages = append(params.Messages, openai.ToolMessage(res, toolCall.ID))
 		}
 	}
@@ -113,9 +199,34 @@ func (c *OpenAILLMClient) LLMCallWithTools(ctx context.Context, query string) (s
 	params.Tools = nil
 	completion, err := c.client.Chat.Completions.New(ctx, params)
 	if err != nil {
+		recordSpanError(span, err)
 		return "", err
 	}
-	return completion.Choices[0].Message.Content, nil
+	if hasTokenUsage(completion.Usage) {
+		tokenUsageAvailable = true
+		inputTokens += completion.Usage.PromptTokens
+		outputTokens += completion.Usage.CompletionTokens
+		totalTokens += completion.Usage.TotalTokens
+	}
+	choice, err := firstChoice(completion)
+	if err != nil {
+		recordSpanError(span, err)
+		return "", err
+	}
+	setAggregatedTokenAttributes(span, tokenUsageAvailable, inputTokens, outputTokens, totalTokens)
+	span.SetAttributes(
+		attribute.Int("llm.tool_call_count", toolCallCount),
+		attribute.Int("llm.tool_call_error_count", toolCallErrorCount),
+		attribute.Bool("llm.max_tool_rounds_exhausted", true),
+	)
+	return choice.Message.Content, nil
+}
+
+func firstChoice(completion *openai.ChatCompletion) (openai.ChatCompletionChoice, error) {
+	if completion == nil || len(completion.Choices) == 0 {
+		return openai.ChatCompletionChoice{}, fmt.Errorf("openai completion returned zero choices")
+	}
+	return completion.Choices[0], nil
 }
 
 func mapsToValues(tooldefs map[string]openai.ChatCompletionToolParam) []openai.ChatCompletionToolParam {
@@ -124,4 +235,32 @@ func mapsToValues(tooldefs map[string]openai.ChatCompletionToolParam) []openai.C
 		vals = append(vals, v)
 	}
 	return vals
+}
+
+func hasTokenUsage(usage openai.CompletionUsage) bool {
+	return usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.TotalTokens > 0
+}
+
+func setTokenAttributes(span interface{ SetAttributes(...attribute.KeyValue) }, usage openai.CompletionUsage) {
+	setAggregatedTokenAttributes(span, hasTokenUsage(usage), usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens)
+}
+
+func setAggregatedTokenAttributes(span interface{ SetAttributes(...attribute.KeyValue) }, available bool, inputTokens, outputTokens, totalTokens int64) {
+	attrs := []attribute.KeyValue{attribute.Bool("llm.token_usage_available", available)}
+	if available {
+		attrs = append(attrs,
+			attribute.Int64("llm.input_tokens", inputTokens),
+			attribute.Int64("llm.output_tokens", outputTokens),
+			attribute.Int64("llm.total_tokens", totalTokens),
+		)
+	}
+	span.SetAttributes(attrs...)
+}
+
+func recordSpanError(span interface {
+	RecordError(error, ...trace.EventOption)
+	SetStatus(codes.Code, string)
+}, err error) {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
 }

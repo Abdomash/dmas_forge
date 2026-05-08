@@ -9,6 +9,9 @@ func main() {
 	name := "travel-planning"
 	cmdbuilder.MakeAndExecute(
 		name,
-		specs.Docker,
+		specs.Single,
+		specs.HTTP,
+		specs.MCP,
+		specs.A2A,
 	)
 }
